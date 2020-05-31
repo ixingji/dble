@@ -17,6 +17,7 @@ import com.actiontech.dble.plan.node.QueryNode;
 import com.actiontech.dble.route.RouteResultset;
 import com.actiontech.dble.route.RouteResultsetNode;
 import com.actiontech.dble.route.function.AbstractPartitionAlgorithm;
+import com.actiontech.dble.route.parser.direct.Value;
 import com.actiontech.dble.route.parser.druid.DruidParser;
 import com.actiontech.dble.route.parser.druid.DruidShardingParseInfo;
 import com.actiontech.dble.route.parser.druid.RouteCalculateUnit;
@@ -32,9 +33,12 @@ import com.actiontech.dble.sqlengine.mpp.ColumnRoutePair;
 import com.actiontech.dble.sqlengine.mpp.LoadData;
 import com.actiontech.dble.util.StringUtil;
 import com.alibaba.druid.sql.ast.SQLExpr;
+import com.alibaba.druid.sql.ast.SQLName;
 import com.alibaba.druid.sql.ast.SQLStatement;
-import com.alibaba.druid.sql.ast.statement.SQLSelectStatement;
+import com.alibaba.druid.sql.ast.statement.*;
+import com.alibaba.druid.sql.dialect.mysql.ast.statement.MySqlSelectQueryBlock;
 import com.alibaba.druid.wall.spi.WallVisitorUtils;
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,10 +66,17 @@ public final class RouterUtil {
         return removeSchema(stmt, schema, DbleServer.getInstance().getSystemVariables().isLowerCaseTableNames());
     }
 
+    public static String removeSchema(String tableName) {
+        if (tableName.contains(".")) {
+            tableName = StringUtils.split(tableName, "\\.")[1];
+        }
+        return tableName;
+    }
+
     /**
      * removeSchema from sql
      *
-     * @param stmt sql
+     * @param stmt        sql
      * @param schema      has change to lowercase if need
      * @param isLowerCase lowercase
      * @return new sql
@@ -251,7 +262,7 @@ public final class RouterUtil {
     /**
      * the first node as the result
      *
-     * @param rrs RouteResultset
+     * @param rrs      RouteResultset
      * @param dataNode NAME
      * @return RouteResultset
      */
@@ -362,7 +373,7 @@ public final class RouterUtil {
      * getRandomDataNode
      *
      * @param schema SchemaConfig
-     * @param table NAME
+     * @param table  NAME
      * @return datanode
      * @author mycat
      */
@@ -572,7 +583,8 @@ public final class RouterUtil {
 
         // where filter contains partition column
         if (partitionCol != null && columnsMap.get(partitionCol) != null) {
-            if (tryCalcNodeForShardingColumn(resultNodes, tablesSet, table, tableConfig, columnsMap, partitionCol)) return false;
+            if (tryCalcNodeForShardingColumn(resultNodes, tablesSet, table, tableConfig, columnsMap, partitionCol))
+                return false;
         } else if (joinKey != null && columnsMap.get(joinKey) != null && columnsMap.get(joinKey).size() != 0) {
             Set<ColumnRoutePair> joinKeyValue = columnsMap.get(joinKey);
             Set<String> dataNodeSet = ruleByJoinValueCalculate(rrs.getStatement(), tableConfig, joinKeyValue);
@@ -635,7 +647,6 @@ public final class RouterUtil {
 
     /**
      * tryRouteFor multiTables
-     *
      */
     private static RouteResultset tryRouteForTables(
             SchemaConfig schema, DruidShardingParseInfo ctx, RouteCalculateUnit routeUnit, RouteResultset rrs,
@@ -832,9 +843,10 @@ public final class RouterUtil {
             }
         }
     }
+
     /**
      * @param schema SchemaConfig
-     * @param tc TableConfig
+     * @param tc     TableConfig
      * @return true for passed
      */
     private static boolean checkRuleRequired(SchemaConfig schema, RouteCalculateUnit routeUnit, TableConfig tc, Pair<String, String> table) {
@@ -857,7 +869,6 @@ public final class RouterUtil {
         }
         return hasRequiredValue;
     }
-
 
 
     private static boolean tryRouteWithCache(
@@ -1068,8 +1079,6 @@ public final class RouterUtil {
     }
 
 
-
-
     /**
      * no shard-ing table dataNode
      *
@@ -1129,5 +1138,242 @@ public final class RouterUtil {
         return Boolean.FALSE.equals(o);
     }
 
+    public static boolean tryRouteDirect(RouteResultset rrs,
+                                         SchemaConfig schemaConfig,
+                                         MySqlSelectQueryBlock selectQueryBlock,
+                                         ServerSchemaStatVisitor visitor) throws Exception {
+
+        List<String> selectTables = visitor.getSelectTableList();
+
+        List<String> sourceTables = new ArrayList<>();
+        collectSourceTables(selectQueryBlock.getFrom(), sourceTables);
+
+        LOGGER.debug("collect source tables:" + sourceTables);
+
+        Map<String, String> aliasMap = visitor.getAliasMap();
+
+        String usedSchemaName = schemaConfig.getName();
+        String firstSchemaName = usedSchemaName;
+
+        for (int i = 0; i < selectTables.size(); i++) {
+            String schemaName = usedSchemaName;
+            String selectTable = selectTables.get(i);
+
+            if (selectTable.contains(".")) {
+                schemaName = StringUtil.removeBackQuote(
+                        StringUtils.split(selectTable, "\\.")[0]
+                );
+            }
+
+            if (i == 0) {
+                firstSchemaName = schemaName;
+            }
+
+            if (!schemaName.equals(firstSchemaName)) {
+                return false; // 不支持跨逻辑库的直接路由
+            }
+        }
+
+        Map<String, SchemaConfig> schemaConfigMap
+                = DbleServer.getInstance().getConfig().getSchemas();
+
+        SchemaConfig actualSchemaConfig = schemaConfigMap.get(firstSchemaName);
+        Map<String, TableConfig> tableConfigMap = actualSchemaConfig.getTables();
+
+        List<TableConfig> splitTableConfigs = new ArrayList<>();
+        List<TableConfig> childTableConfigs = new ArrayList<>();
+        List<TableConfig> globalTableConfigs = new ArrayList<>();
+
+        List<String> normalTableNames = new ArrayList<>();
+
+        for (String selectTable : selectTables) {
+            String tableName = selectTable.toLowerCase();
+
+            if (selectTable.contains(".")) {
+                tableName = StringUtil.removeBackQuote(
+                        StringUtils.split(tableName, "\\.")[1]
+                );
+            }
+
+            TableConfig tableConfig = null;
+            if ((tableConfig = tableConfigMap.get(tableName)) == null) {
+                normalTableNames.add(tableName);
+            } else if (tableConfig.isGlobalTable()) {
+                globalTableConfigs.add(tableConfig);
+            } else if (tableConfig.getParentTC() != null) {
+                childTableConfigs.add(tableConfig);
+            } else {
+                splitTableConfigs.add(tableConfig);
+            }
+        }
+
+        if (normalTableNames.size() > 0) {
+            if (splitTableConfigs.size() == 0 && childTableConfigs.size() == 0) {
+                // 构建路由节点
+                return true;
+            }
+            return false;
+        } else if (splitTableConfigs.size() == 0
+                && childTableConfigs.size() == 0
+                && globalTableConfigs.size() > 0) {
+            routeToRandomNode(
+                    rrs,
+                    actualSchemaConfig,
+                    findShortestGlobalTable(globalTableConfigs).getName()
+            );
+            rrs.setFinishedRoute(true);
+            return true;
+        }
+
+        List<String> firstSplitTableNodes = null;
+        if (splitTableConfigs.size() >= 1) {
+            firstSplitTableNodes = splitTableConfigs.get(0).getDataNodes();
+            for (TableConfig splitTableConfig : splitTableConfigs) {
+                if (!checkSplitTablesNodes(firstSplitTableNodes, splitTableConfig.getDataNodes())) {
+                    return false;
+                }
+            }
+        }
+
+        if (firstSplitTableNodes != null && childTableConfigs.size() > 0) {
+            for (TableConfig childTableConfig : childTableConfigs) {
+                if (!checkSplitTablesNodes(firstSplitTableNodes, childTableConfig.getDataNodes())) {
+                    return false;
+                }
+            }
+        }
+
+        Set<String> routeNodes = tryRouteDirectQuery(
+                actualSchemaConfig,
+                selectQueryBlock,
+                tableConfigMap,
+                aliasMap
+        );
+
+        List<SQLSelect> subQueryList = visitor.getSubQueryList();
+        if (subQueryList.size() > 0) {
+            if(routeNodes == null || routeNodes.size() != 1) {
+                return false;
+            }
+
+            Set<String> querySourceNodes;
+            for (SQLSelect sqlSelect : subQueryList) {
+                querySourceNodes = tryRouteDirectQuery(
+                        actualSchemaConfig,
+                        (MySqlSelectQueryBlock) sqlSelect.getQueryBlock(),
+                        tableConfigMap,
+                        aliasMap
+                );
+
+                if (querySourceNodes == null
+                        || querySourceNodes.size() != 1
+                        || !querySourceNodes.containsAll(routeNodes)) {
+                    return false;
+                }
+            }
+        }
+
+        if (routeNodes == null) {
+            LOGGER.warn("direct route nodes is empty");
+            return false;
+        }
+
+        LOGGER.info("direct route nodes: " + routeNodes);
+
+        routeToMultiNode(rrs.isSqlRouteCacheAble(), rrs, routeNodes);
+        rrs.setFinishedRoute(true);
+
+        return true;
+    }
+
+    private static Set<String> tryRouteDirectQuery(SchemaConfig schemaConfig, MySqlSelectQueryBlock selectQueryBlock, Map<String, TableConfig> tableConfigMap, Map<String, String> aliasMap) {
+        List<String> sourceTables = new ArrayList<>();
+        collectSourceTables(selectQueryBlock.getFrom(), sourceTables);
+
+        LOGGER.debug("collect source tables:" + sourceTables);
+
+        List<TableConfig> splitTableConfigs = new ArrayList<>();
+        List<TableConfig> childTableConfigs = new ArrayList<>();
+        List<TableConfig> globalTableConfigs = new ArrayList<>();
+
+        for (String sourceTable : sourceTables) {
+            String tableName = sourceTable.toLowerCase();
+
+            if (sourceTable.contains(".")) {
+                tableName = StringUtil.removeBackQuote(
+                        StringUtils.split(tableName, "\\.")[1]
+                );
+            }
+
+            TableConfig tableConfig = null;
+            if ((tableConfig = tableConfigMap.get(tableName)) == null) {
+//                normalTableNames.add(tableName);
+            } else if (tableConfig.isGlobalTable()) {
+                globalTableConfigs.add(tableConfig);
+            } else if (tableConfig.getParentTC() != null) {
+                childTableConfigs.add(tableConfig);
+            } else {
+                splitTableConfigs.add(tableConfig);
+            }
+        }
+
+        List<List<Value>> expectedEqList = new ArrayList<>();
+
+        return null;
+    }
+
+    private static void collectSourceTables(SQLTableSource fromTableSource, List<String> sourceTables) {
+        if (fromTableSource instanceof SQLExprTableSource) {
+            SQLExprTableSource exprTableSource = (SQLExprTableSource) fromTableSource;
+            if (exprTableSource.getExpr() instanceof SQLName) {
+                sourceTables.add(
+                        removeBackQuoteOfTable(exprTableSource.getExpr().toString())
+                );
+            }
+        } else if (fromTableSource instanceof SQLJoinTableSource) {
+            SQLJoinTableSource joinTableSource = (SQLJoinTableSource) fromTableSource;
+            collectSourceTables(joinTableSource.getLeft(), sourceTables);
+            collectSourceTables(joinTableSource.getRight(), sourceTables);
+        }
+    }
+
+    public static TableConfig findShortestGlobalTable(List<TableConfig> globalTables) {
+        TableConfig shortestGlobalTable = globalTables.get(0);
+        if (globalTables.size() > 1) {
+            for (TableConfig currentGlobalTable : globalTables) {
+                if (shortestGlobalTable.getDataNodes().size()
+                        > currentGlobalTable.getDataNodes().size()) {
+                    shortestGlobalTable = currentGlobalTable;
+                }
+            }
+        }
+        return shortestGlobalTable;
+    }
+
+    public static String removeBackQuoteOfTable(String fullTable) {
+        if (fullTable.contains(".")) {
+            String[] tableArr = StringUtils.split(fullTable, "\\.");
+            String schema = tableArr[0];
+            String table = tableArr[1];
+            return StringUtil.removeBackQuote(schema)
+                    + "."
+                    + StringUtil.removeBackQuote(table);
+        }
+        return StringUtil.removeBackQuote(fullTable);
+    }
+
+    private static boolean checkSplitTablesNodes(List<String> dataNodes,
+                                                 List<String> dataNodes2) {
+        if (dataNodes.size() != dataNodes2.size()) {
+            return false;
+        }
+
+        for (int i = 0; i < dataNodes.size(); i++) {
+            if (!dataNodes.get(i).equals(dataNodes2.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
 
 }
